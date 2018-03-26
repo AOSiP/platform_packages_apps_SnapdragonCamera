@@ -28,6 +28,7 @@ import android.content.ContentValues;
 import android.content.Context;
 import android.content.DialogInterface;
 import android.content.Intent;
+import android.content.SharedPreferences;
 import android.content.res.Configuration;
 import android.graphics.Bitmap;
 import android.graphics.ImageFormat;
@@ -72,6 +73,7 @@ import android.os.Bundle;
 import android.os.Message;
 import android.os.ParcelFileDescriptor;
 import android.os.SystemClock;
+import android.preference.PreferenceManager;
 import android.provider.MediaStore;
 import android.util.Log;
 import android.util.Range;
@@ -140,9 +142,11 @@ public class CaptureModule implements CameraModule, PhotoController,
     public static final int DUAL_MODE = 0;
     public static final int BAYER_MODE = 1;
     public static final int MONO_MODE = 2;
+    public static final int SWITCH_MODE = 3;
     public static final int BAYER_ID = 0;
     public static int MONO_ID = -1;
     public static int FRONT_ID = -1;
+    public static int SWITCH_ID = -1;
     public static final int INTENT_MODE_NORMAL = 0;
     public static final int INTENT_MODE_CAPTURE = 1;
     public static final int INTENT_MODE_VIDEO = 2;
@@ -157,6 +161,15 @@ public class CaptureModule implements CameraModule, PhotoController,
             new MeteringRectangle(0, 0, 0, 0, 0)};
     private static final String EXTRA_QUICK_CAPTURE =
             "android.intent.extra.quickCapture";
+    //0~6 is for bokeh toast message
+    private static final int NO_DEPTH_EFFECT = 0;
+    private static final int DEPTH_EFFECT_SUCCESS = 1;
+    private static final int TOO_NEAR = 2;
+    private static final int TOO_FAR = 3;
+    private static final int LOW_LIGHT = 4;
+    private static final int SUBJECT_NOT_FOUND = 5;
+    private static final int TOUCH_TO_FOCUS = 6;
+
     /**
      * Camera state: Showing camera preview.
      */
@@ -254,6 +267,12 @@ public class CaptureModule implements CameraModule, PhotoController,
                     byte[].class);
     public static final CameraCharacteristics.Key<int[]> hfrSizeList =
             new CameraCharacteristics.Key<>("org.codeaurora.qcamera3.hfr.sizes", int[].class);
+    public static final CaptureRequest.Key<Boolean> bokeh_enable = new CaptureRequest.Key<>(
+            "org.codeaurora.qcamera3.bokeh.enable", Boolean.class);
+    public static final CaptureRequest.Key<Integer> bokeh_blur_level = new CaptureRequest.Key<>(
+            "org.codeaurora.qcamera3.bokeh.blurLevel", Integer.class);
+    public static final CaptureResult.Key<Integer> bokeh_status =
+            new CaptureResult.Key<>("org.codeaurora.qcamera3.bokeh.status", Integer.class);
 
     private boolean[] mTakingPicture = new boolean[MAX_NUM_CAM];
     private int mControlAFMode = CameraMetadata.CONTROL_AF_MODE_CONTINUOUS_PICTURE;
@@ -385,6 +404,8 @@ public class CaptureModule implements CameraModule, PhotoController,
     private boolean mHighSpeedCapture = false;
     private boolean mHighSpeedRecordingMode = false; //HFR
     private int mHighSpeedCaptureRate;
+    private boolean mBokehEnabled = false;
+    private CaptureRequest.Builder mBokehRequestBuilder;
     private CaptureRequest.Builder mVideoRequestBuilder;
 
     public static int statsdata[] = new int[1024];
@@ -597,10 +618,66 @@ public class CaptureModule implements CameraModule, PhotoController,
                     updateGraghView();
                 }
             }
+            showBokehStatusMessage(id, result);
             processCaptureResult(result);
             mPostProcessor.onMetaAvailable(result);
         }
     };
+
+    private void showBokehStatusMessage(int id, CaptureResult partialResult) {
+        if (!mBokehEnabled || partialResult == null) {
+            return;
+        }
+        Integer status = -1;
+        try {
+            status = partialResult.get(bokeh_status);
+            if (status == null) {
+                return;
+            }
+        } catch (IllegalArgumentException e) {
+            Log.d(TAG, "cannot find vendor tag: " + bokeh_status);
+        }
+        final String tip;
+        switch (status) {
+            case TOO_FAR:
+                tip = "Too far";
+                break;
+            case TOO_NEAR:
+                tip = "Too near";
+                break;
+            case LOW_LIGHT:
+                tip = "Low light";
+                break;
+            case SUBJECT_NOT_FOUND:
+                tip = "Object not found";
+                break;
+            case DEPTH_EFFECT_SUCCESS:
+                tip = "Depth effect success";
+                break;
+            case NO_DEPTH_EFFECT:
+                tip = "NO depth effect";
+                break;
+            default:
+                tip = "Message type =" + status;
+                break;
+        }
+        boolean mDepthSuccess = status == DEPTH_EFFECT_SUCCESS;
+        mActivity.runOnUiThread(new Runnable() {
+            @Override
+            public void run() {
+                if (mUI.getBokehTipView() != null) {
+                    if (!mDepthSuccess) {
+                        mUI.getBokehTipRct().setVisibility(View.VISIBLE);
+                        mUI.getBokehTipView().setVisibility(View.VISIBLE);
+                        mUI.getBokehTipView().setText(tip);
+                    } else {
+                        mUI.getBokehTipView().setVisibility(View.GONE);
+                        mUI.getBokehTipRct().setVisibility(View.GONE);
+                    }
+                }
+            }
+        });
+    }
 
     private final CameraDevice.StateCallback mStateCallback = new CameraDevice.StateCallback() {
 
@@ -645,9 +722,16 @@ public class CaptureModule implements CameraModule, PhotoController,
         public void onError(CameraDevice cameraDevice, int error) {
             int id = Integer.parseInt(cameraDevice.getId());
             Log.e(TAG, "onError " + id + " " + error);
+            if (mCamerasOpened) {
+                mCameraDevice[id].close();
+                mCameraDevice[id] = null;
+            }
             mCameraOpenCloseLock.release();
             mCamerasOpened = false;
+
             if (null != mActivity) {
+                Toast.makeText(mActivity,"open camera error id =" + id,
+                        Toast.LENGTH_LONG).show();
                 mActivity.finish();
             }
         }
@@ -805,6 +889,14 @@ public class CaptureModule implements CameraModule, PhotoController,
     }
 
     public boolean isBackCamera() {
+        String switchValue = mSettingsManager.getValue(SettingsManager.KEY_SWITCH_CAMERA);
+        if (switchValue != null && !switchValue.equals("-1") ) {
+            CharSequence[] value = mSettingsManager.getEntryValues(SettingsManager.KEY_SWITCH_CAMERA);
+            if (value.toString().contains("front"))
+                return false;
+            else
+                return true;
+        }
         String value = mSettingsManager.getValue(SettingsManager.KEY_CAMERA_ID);
         if (value == null) return true;
         if (Integer.parseInt(value) == BAYER_ID) return true;
@@ -812,6 +904,10 @@ public class CaptureModule implements CameraModule, PhotoController,
     }
 
     public int getCameraMode() {
+        String switchValue = mSettingsManager.getValue(SettingsManager.KEY_SWITCH_CAMERA);
+        if (switchValue != null && !switchValue.equals("-1") ) {
+            return SWITCH_MODE;
+        }
         String value = mSettingsManager.getValue(SettingsManager.KEY_SCENE_MODE);
         if (value != null && value.equals(SettingsManager.SCENE_MODE_DUAL_STRING)) return DUAL_MODE;
         value = mSettingsManager.getValue(SettingsManager.KEY_MONO_ONLY);
@@ -962,9 +1058,13 @@ public class CaptureModule implements CameraModule, PhotoController,
                 case MONO_MODE:
                     createSession(MONO_ID);
                     break;
+                case SWITCH_MODE:
+                    createSession(SWITCH_ID);
+                    break;
             }
         } else {
-            createSession(FRONT_ID);
+            int cameraId = SWITCH_ID == -1? FRONT_ID : SWITCH_ID;
+            createSession(cameraId);
         }
     }
 
@@ -1042,7 +1142,8 @@ public class CaptureModule implements CameraModule, PhotoController,
                                 // Finally, we start displaying the camera preview.
                                 // for cases where we are in dual mode with mono preview off,
                                 // don't set repeating request for mono
-                                if(id == MONO_ID && !canStartMonoPreview()) {
+                                if(id == MONO_ID && !canStartMonoPreview()
+                                        && getCameraMode() == DUAL_MODE) {
                                     mCaptureSession[id].capture(mPreviewRequestBuilder[id]
                                             .build(), mCaptureCallback, mCameraHandler);
                                 } else {
@@ -1308,7 +1409,7 @@ public class CaptureModule implements CameraModule, PhotoController,
                         lockFocus(MONO_ID);
                         break;
                     case BAYER_MODE:
-                        if (takeZSLPicture(BAYER_ID)) {
+                        if(takeZSLPicture(BAYER_ID)) {
                             return;
                         }
                         lockFocus(BAYER_ID);
@@ -1316,12 +1417,19 @@ public class CaptureModule implements CameraModule, PhotoController,
                     case MONO_MODE:
                         lockFocus(MONO_ID);
                         break;
+                    case SWITCH_MODE:
+                        if (takeZSLPicture(SWITCH_ID)) {
+                            return;
+                        }
+                        lockFocus(SWITCH_ID);
+                        break;
                 }
             } else {
-                if (takeZSLPicture(FRONT_ID)) {
+                int cameraId = SWITCH_ID == -1? FRONT_ID : SWITCH_ID;
+                if(takeZSLPicture(cameraId)) {
                     return;
                 }
-                lockFocus(FRONT_ID);
+                lockFocus(cameraId);
             }
         }
     }
@@ -1350,9 +1458,12 @@ public class CaptureModule implements CameraModule, PhotoController,
                 case MONO_MODE:
                     cameraId = MONO_ID;
                     break;
+                case SWITCH_MODE:
+                    cameraId = SWITCH_ID;
+                    break;
             }
         } else {
-            cameraId = FRONT_ID;
+            cameraId = SWITCH_ID == -1? FRONT_ID : SWITCH_ID;
         }
         captureStillPicture(cameraId);
     }
@@ -2156,6 +2267,7 @@ public class CaptureModule implements CameraModule, PhotoController,
         applySaturationLevel(builder);
         applyAntiBandingLevel(builder);
         applyHistogram(builder);
+        enableBokeh(builder);
     }
 
     /**
@@ -2276,6 +2388,7 @@ public class CaptureModule implements CameraModule, PhotoController,
         stopBackgroundThread();
         mLastJpegData = null;
         setProModeVisible();
+        setBokehModeVisible();
         mJpegImageData = null;
         closeVideoFileDescriptor();
     }
@@ -2449,6 +2562,7 @@ public class CaptureModule implements CameraModule, PhotoController,
     @Override
     public void onResumeAfterSuper() {
         Log.d(TAG, "onResume " + getCameraMode());
+        reinit();
         initializeValues();
         updatePreviewSize();
         mCameraIdList = new ArrayList<>();
@@ -2474,9 +2588,14 @@ public class CaptureModule implements CameraModule, PhotoController,
                     msg.arg1 = MONO_ID;
                     mCameraHandler.sendMessage(msg);
                     break;
+                case SWITCH_MODE:
+                    msg.arg1 = SWITCH_ID;
+                    mCameraHandler.sendMessage(msg);
+                    break;
             }
         } else {
-            msg.arg1 = FRONT_ID;
+            int cameraId = SWITCH_ID == -1? FRONT_ID : SWITCH_ID;
+            msg.arg1 = cameraId;
             mCameraHandler.sendMessage(msg);
         }
         mUI.showSurfaceView();
@@ -2495,6 +2614,7 @@ public class CaptureModule implements CameraModule, PhotoController,
         mUI.enableShutter(true);
         mUI.enableVideo(true);
         setProModeVisible();
+        setBokehModeVisible();
 
         String scene = mSettingsManager.getValue(SettingsManager.KEY_SCENE_MODE);
         if (Integer.parseInt(scene) != SettingsManager.SCENE_MODE_UBIFOCUS_INT) {
@@ -2612,9 +2732,13 @@ public class CaptureModule implements CameraModule, PhotoController,
                 case MONO_MODE:
                     applyZoomAndUpdate(MONO_ID);
                     break;
+                case SWITCH_MODE:
+                    applyZoomAndUpdate(SWITCH_ID);
+                    break;
             }
         } else {
-            applyZoomAndUpdate(FRONT_ID);
+            int cameraId = SWITCH_ID == -1? FRONT_ID : SWITCH_ID;
+            applyZoomAndUpdate(cameraId);
         }
         mUI.updateFaceViewCameraBound(mCropRegion[getMainCameraId()]);
     }
@@ -2628,7 +2752,11 @@ public class CaptureModule implements CameraModule, PhotoController,
                     return cameraId == BAYER_ID;
                 case MONO_MODE:
                     return cameraId == MONO_ID;
+                case SWITCH_MODE:
+                    return cameraId == SWITCH_ID;
             }
+        } else if (SWITCH_ID != -1) {
+            return cameraId == SWITCH_ID;
         } else {
             return cameraId == FRONT_ID;
         }
@@ -2795,9 +2923,13 @@ public class CaptureModule implements CameraModule, PhotoController,
                 case MONO_MODE:
                     triggerFocusAtPoint(x, y, MONO_ID);
                     break;
+                case SWITCH_MODE:
+                    triggerFocusAtPoint(x, y, SWITCH_ID);
+                    break;
             }
         } else {
-            triggerFocusAtPoint(x, y, FRONT_ID);
+            int cameraId = SWITCH_ID == -1? FRONT_ID : SWITCH_ID;
+            triggerFocusAtPoint(x, y, cameraId);
         }
     }
 
@@ -2809,10 +2941,13 @@ public class CaptureModule implements CameraModule, PhotoController,
                     return BAYER_ID;
                 case MONO_MODE:
                     return MONO_ID;
+                case SWITCH_MODE:
+                    return SWITCH_ID;
             }
             return 0;
         } else {
-            return FRONT_ID;
+            int cameraId = SWITCH_ID == -1? FRONT_ID : SWITCH_ID;
+            return cameraId;
         }
     }
 
@@ -3105,6 +3240,7 @@ public class CaptureModule implements CameraModule, PhotoController,
 
     private void updateVideoSize() {
         String videoSize = mSettingsManager.getValue(SettingsManager.KEY_VIDEO_QUALITY);
+        if (videoSize == null) return;
         mVideoSize = parsePictureSize(videoSize);
         Size[] prevSizes = mSettingsManager.getSupportedOutputSize(getMainCameraId(),
                 MediaRecorder.class);
@@ -3646,7 +3782,18 @@ public class CaptureModule implements CameraModule, PhotoController,
         updateHFRSetting();
         boolean hfr = mHighSpeedCapture && !mHighSpeedRecordingMode;
 
-        mProfile = CamcorderProfile.get(cameraId, size);
+        if (CamcorderProfile.hasProfile(cameraId, size)) {
+            mProfile = CamcorderProfile.get(cameraId, size);
+        } else {
+            if (!"-1".equals(mSettingsManager.getValue(SettingsManager.KEY_SWITCH_CAMERA))) {
+                mProfile = CamcorderProfile.get(CamcorderProfile.QUALITY_HIGH);
+            } else {
+                RotateTextToast.makeText(mActivity, R.string.error_app_unsupported_profile,
+                        Toast.LENGTH_LONG).show();
+                return;
+            }
+        }
+
         int videoWidth = mProfile.videoFrameWidth;
         int videoHeight = mProfile.videoFrameHeight;
         mUnsupportedResolution = false;
@@ -4041,6 +4188,36 @@ public class CaptureModule implements CameraModule, PhotoController,
         updateGraghViewVisibility(View.GONE);
     }
 
+    private void enableBokeh(CaptureRequest.Builder request) {
+        if (mBokehEnabled) {
+            mBokehRequestBuilder = request;
+            try {
+                request.set(CaptureModule.bokeh_enable, true);
+                final SharedPreferences prefs =
+                        PreferenceManager.getDefaultSharedPreferences(mActivity);
+                int progress = prefs.getInt(SettingsManager.KEY_BOKEH_BLUR_DEGREE, 50);
+                request.set(CaptureModule.bokeh_blur_level, progress);
+            } catch (IllegalArgumentException e) {
+                Log.e(TAG, "can not find vendor tag : org.codeaurora.qcamera3.bokeh");
+            }
+        }
+    }
+
+    public void setBokehBlurDegree(int degree) {
+        if (!checkSessionAndBuilder(mCaptureSession[getMainCameraId()], mBokehRequestBuilder)) {
+            return;
+        }
+        try {
+            mBokehRequestBuilder.set(CaptureModule.bokeh_blur_level, degree);
+            mCaptureSession[getMainCameraId()].setRepeatingRequest(mBokehRequestBuilder
+                    .build(), mCaptureCallback, mCameraHandler);
+        } catch (IllegalArgumentException e) {
+            Log.e(TAG, "can not find vendor tag : " + CaptureModule.bokeh_blur_level);
+        } catch (CameraAccessException e) {
+            Log.e(TAG, "Camera Access Exception in setBokehBlurDegree");
+        }
+    }
+
     private void updateGraghViewVisibility(final int visibility) {
         mActivity.runOnUiThread(new Runnable() {
             public void run() {
@@ -4183,7 +4360,8 @@ public class CaptureModule implements CameraModule, PhotoController,
         }
         if (mode != CaptureRequest.CONTROL_SCENE_MODE_DISABLED
                 && mode != SettingsManager.SCENE_MODE_DUAL_INT
-                && mode != SettingsManager.SCENE_MODE_PROMODE_INT) {
+                && mode != SettingsManager.SCENE_MODE_PROMODE_INT
+                && mode != SettingsManager.SCENE_MODE_BOKEH_INT) {
             request.set(CaptureRequest.CONTROL_SCENE_MODE, mode);
             request.set(CaptureRequest.CONTROL_MODE, CaptureRequest.CONTROL_MODE_USE_SCENE_MODE);
         } else {
@@ -4429,6 +4607,7 @@ public class CaptureModule implements CameraModule, PhotoController,
         boolean updatePreviewBayer = false;
         boolean updatePreviewMono = false;
         boolean updatePreviewFront = false;
+        boolean updatePreviewLogical = false;
         int count = 0;
         for (SettingsManager.SettingState settingState : settings) {
             String key = settingState.key;
@@ -4462,6 +4641,7 @@ public class CaptureModule implements CameraModule, PhotoController,
                 case SettingsManager.KEY_CAMERA_ID:
                 case SettingsManager.KEY_MONO_ONLY:
                 case SettingsManager.KEY_CLEARSIGHT:
+                case SettingsManager.KEY_SWITCH_CAMERA:
                 case SettingsManager.KEY_MONO_PREVIEW:
                     if (count == 0) restartAll();
                     return;
@@ -4492,8 +4672,13 @@ public class CaptureModule implements CameraModule, PhotoController,
                         updatePreviewBayer |= applyPreferenceToPreview(BAYER_ID, key, value);
                         updatePreviewMono |= applyPreferenceToPreview(MONO_ID, key, value);
                         break;
+                    case SWITCH_MODE:
+                        updatePreviewMono |= applyPreferenceToPreview(SWITCH_ID, key, value);
+                        break;
                 }
-            } else {
+            } else if (SWITCH_ID != -1) {
+                updatePreviewLogical = applyPreferenceToPreview(SWITCH_ID,key,value);
+            }else {
                 updatePreviewFront |= applyPreferenceToPreview(FRONT_ID, key, value);
             }
             count++;
@@ -4530,6 +4715,18 @@ public class CaptureModule implements CameraModule, PhotoController,
                 if (checkSessionAndBuilder(mCaptureSession[FRONT_ID],
                         mPreviewRequestBuilder[FRONT_ID])) {
                     mCaptureSession[FRONT_ID].setRepeatingRequest(mPreviewRequestBuilder[FRONT_ID]
+                            .build(), mCaptureCallback, mCameraHandler);
+                }
+            } catch (CameraAccessException | IllegalStateException e) {
+                e.printStackTrace();
+            }
+        }
+
+        if (updatePreviewLogical) {
+            try {
+                if (checkSessionAndBuilder(mCaptureSession[SWITCH_ID],
+                        mPreviewRequestBuilder[SWITCH_ID])) {
+                    mCaptureSession[SWITCH_ID].setRepeatingRequest(mPreviewRequestBuilder[SWITCH_ID]
                             .build(), mCaptureCallback, mCameraHandler);
                 }
             } catch (CameraAccessException | IllegalStateException e) {
@@ -4986,6 +5183,23 @@ public class CaptureModule implements CameraModule, PhotoController,
             }
         }
         mUI.initializeProMode(!mPaused && promode);
+    }
+
+    private void setBokehModeVisible() {
+        String scene = mSettingsManager.getValue(SettingsManager.KEY_SCENE_MODE);
+        if (scene != null) {
+            int mode = Integer.parseInt(scene);
+            mBokehEnabled = mode == SettingsManager.SCENE_MODE_BOKEH_INT;
+        }
+        mUI.initializeBokehMode(!mPaused && mBokehEnabled);
+        if (mPaused || !mBokehEnabled) {//disable bokeh mode
+            mBokehRequestBuilder = null;
+        }
+        if (mBokehEnabled) {
+            keepScreenOn();
+        } else {
+            keepScreenOnAwhile();
+        }
     }
 	
     boolean checkSessionAndBuilder(CameraCaptureSession session, CaptureRequest.Builder builder) {
